@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mapala"
+version = "0.1.0"
+description = "Outil simple de mapping template/source avec concaténation"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.11"
+authors = [
+    {name = "LaConcorde Contributors"}
+]
+keywords = ["excel", "template", "mapping", "concat", "data-linking"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "pandas>=2.0.0",
+    "openpyxl>=3.1.0",
+    "odfpy>=1.0.0",
+    "PySide6>=6.5.0",
+]
+
+[project.optional-dependencies]
+build = [
+    "pyinstaller>=6.0.0",
+]
+formats = [
+    "xlrd>=2.0.0",
+    "odfpy>=1.0.0",
+]
+
+[project.scripts]
+mapala = "mapala.app:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

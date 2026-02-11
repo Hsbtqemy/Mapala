@@ -388,6 +388,8 @@ class MappingScreen(QWidget):
         self._export_btn = QPushButton("Exporter")
         self._export_btn.clicked.connect(self._export)
         self._export_menu = QMenu(self._export_btn)
+        export_all = self._export_menu.addAction("Exporter (xlsx/ods/csv)")
+        export_all.triggered.connect(lambda _checked=False: self._export())
         export_csv_full = self._export_menu.addAction("Exporter CSV (complet)")
         export_csv_full.triggered.connect(lambda _checked=False: self._export_csv(False))
         export_csv_trim = self._export_menu.addAction("Exporter CSV (sans colonnes vides)")

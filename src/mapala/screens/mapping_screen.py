@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
-from PySide6.QtCore import QEvent, QObject, Qt, Signal
+from PySide6.QtCore import QEvent, QObject, QItemSelectionModel, QThread, Qt, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
     QToolButton,
     QVBoxLayout,
     QWidget,
+    QApplication,
 )
 
 from mapala.io_excel import (
@@ -42,10 +43,34 @@ from mapala.io_excel import (
     load_sheet_raw,
     save_output,
 )
-from mapala.template_builder import TemplateBuilderConfig, ZoneSpec, _build_zone_output, build_output
+from mapala.template_builder import TemplateBuilderConfig, ZoneSpec, _build_zone_output, _format_value, build_output
 
 
 CONCAT_MENU_VALUE = "__CONCAT__"
+SOURCE_ORDER_ORIGIN = "origin"
+SOURCE_ORDER_AZ = "az"
+SOURCE_ORDER_ZA = "za"
+SOURCE_ORDER_VALUE = "value"
+SOURCE_ORDER_USAGE = "usage"
+SOURCE_ORDER_MANUAL = "manual"
+
+
+class _ExportWorker(QObject):
+    finished = Signal(bool, str)
+
+    def __init__(self, config: TemplateBuilderConfig, output_path: str) -> None:
+        super().__init__()
+        self._config = config
+        self._output_path = output_path
+
+    def run(self) -> None:
+        try:
+            output = build_output(self._config)
+            save_output(self._output_path, output, header=False, index=False)
+        except Exception as e:
+            self.finished.emit(False, str(e))
+            return
+        self.finished.emit(True, "")
 
 
 def _parse_int_list(text: str) -> list[int]:
@@ -116,6 +141,12 @@ class MappingScreen(QWidget):
         self._mapping_concat_loading = False
         self._preview_combo_by_col: dict[int, QComboBox] = {}
         self._preview_concat_btn_by_col: dict[int, QToolButton] = {}
+        self._source_order_mode = SOURCE_ORDER_ORIGIN
+        self._source_default_order: list[str] = []
+        self._source_manual_order: list[str] = []
+        self._source_row_lookup: dict[str, int] = {}
+        self._export_thread: QThread | None = None
+        self._export_worker: _ExportWorker | None = None
         self._setup_ui()
 
     def _setup_ui(self) -> None:
@@ -150,10 +181,51 @@ class MappingScreen(QWidget):
         source_header.addWidget(self._source_header_spin)
         source_layout.addLayout(source_header)
 
-        self._mapping_source_list = QListWidget()
-        self._mapping_source_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        self._mapping_source_list.viewport().installEventFilter(self)
-        source_layout.addWidget(self._mapping_source_list, 1)
+        source_tools = QHBoxLayout()
+        source_tools.addWidget(QLabel("Apercu ligne:"))
+        self._source_preview_row_spin = QSpinBox()
+        self._source_preview_row_spin.setRange(0, 1000000)
+        self._source_preview_row_spin.setValue(1)
+        self._source_preview_row_spin.valueChanged.connect(self._on_source_preview_row_changed)
+        source_tools.addWidget(self._source_preview_row_spin)
+        source_tools.addSpacing(8)
+        source_tools.addWidget(QLabel("Ordre:"))
+        self._source_order_combo = QComboBox()
+        self._source_order_combo.addItem("Origine", SOURCE_ORDER_ORIGIN)
+        self._source_order_combo.addItem("A-Z", SOURCE_ORDER_AZ)
+        self._source_order_combo.addItem("Z-A", SOURCE_ORDER_ZA)
+        self._source_order_combo.addItem("Valeur", SOURCE_ORDER_VALUE)
+        self._source_order_combo.addItem("Usage", SOURCE_ORDER_USAGE)
+        self._source_order_combo.addItem("Manuel", SOURCE_ORDER_MANUAL)
+        self._source_order_combo.currentIndexChanged.connect(self._on_source_order_changed)
+        source_tools.addWidget(self._source_order_combo)
+        source_tools.addStretch()
+        source_layout.addLayout(source_tools)
+
+        self._mapping_source_table = QTableWidget()
+        self._mapping_source_table.setColumnCount(3)
+        self._mapping_source_table.setHorizontalHeaderLabels(
+            ["Colonne", "Apercu (ligne 1)", "Usage"]
+        )
+        self._mapping_source_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._mapping_source_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self._mapping_source_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._mapping_source_table.verticalHeader().setVisible(False)
+        src_header = self._mapping_source_table.horizontalHeader()
+        src_header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        src_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        src_header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self._mapping_source_table.setSortingEnabled(False)
+        self._mapping_source_table.setDragDropOverwriteMode(False)
+        self._mapping_source_table.setDragDropMode(QAbstractItemView.DragDropMode.NoDragDrop)
+        self._mapping_source_table.setDragEnabled(False)
+        self._mapping_source_table.setAcceptDrops(False)
+        self._mapping_source_table.setDropIndicatorShown(False)
+        self._mapping_source_table.viewport().installEventFilter(self)
+        model = self._mapping_source_table.model()
+        if model is not None:
+            model.rowsMoved.connect(self._on_source_rows_moved)
+        source_layout.addWidget(self._mapping_source_table, 1)
         source_group.setLayout(source_layout)
         left_layout.addWidget(source_group, 3)
 
@@ -308,7 +380,7 @@ class MappingScreen(QWidget):
             if obj == self._mapping_preview_table.viewport() and not self._template_path:
                 self._browse_template()
                 return True
-            if obj == self._mapping_source_list.viewport() and not self._source_path:
+            if obj == self._mapping_source_table.viewport() and not self._source_path:
                 self._browse_source()
                 return True
         return super().eventFilter(obj, event)
@@ -411,14 +483,17 @@ class MappingScreen(QWidget):
 
     def _refresh_mapping_sources(self) -> None:
         source_cols = self._get_source_cols()
-        self._mapping_source_list.blockSignals(True)
-        self._mapping_source_list.clear()
-        for col in source_cols:
-            item = QListWidgetItem(col)
-            item.setData(Qt.ItemDataRole.UserRole, col)
-            self._mapping_source_list.addItem(item)
-        self._mapping_source_list.blockSignals(False)
-        self._refresh_source_usage()
+        self._source_default_order = list(source_cols)
+        self._source_manual_order = list(source_cols)
+        self._source_row_lookup = {}
+        self._source_order_mode = SOURCE_ORDER_ORIGIN
+        self._source_order_combo.blockSignals(True)
+        idx = self._source_order_combo.findData(SOURCE_ORDER_ORIGIN)
+        if idx >= 0:
+            self._source_order_combo.setCurrentIndex(idx)
+        self._source_order_combo.blockSignals(False)
+        self._apply_source_order_mode()
+        self._refresh_source_table(keep_selection=False)
         self._refresh_concat_source_widgets(source_cols)
 
     def _refresh_concat_source_widgets(self, source_cols: list[str]) -> None:
@@ -427,6 +502,213 @@ class MappingScreen(QWidget):
             widget = self._concat_sources_list.itemWidget(item)
             if isinstance(widget, _ConcatSourceWidget):
                 widget.refresh_source_cols(source_cols)
+
+    def _on_source_preview_row_changed(self) -> None:
+        self._refresh_source_table(keep_selection=True)
+
+    def _on_source_order_changed(self) -> None:
+        mode = self._source_order_combo.currentData()
+        if mode not in (
+            SOURCE_ORDER_ORIGIN,
+            SOURCE_ORDER_AZ,
+            SOURCE_ORDER_ZA,
+            SOURCE_ORDER_VALUE,
+            SOURCE_ORDER_USAGE,
+            SOURCE_ORDER_MANUAL,
+        ):
+            return
+        if mode == SOURCE_ORDER_MANUAL and not self._source_manual_order:
+            self._source_manual_order = self._get_source_table_order() or list(self._source_default_order)
+        self._source_order_mode = mode
+        self._apply_source_order_mode()
+        self._refresh_source_table(keep_selection=True)
+
+    def _apply_source_order_mode(self) -> None:
+        if self._source_order_mode == SOURCE_ORDER_MANUAL:
+            self._mapping_source_table.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+            self._mapping_source_table.setDragEnabled(True)
+            self._mapping_source_table.setAcceptDrops(True)
+            self._mapping_source_table.setDropIndicatorShown(True)
+            self._mapping_source_table.setDefaultDropAction(Qt.DropAction.MoveAction)
+        else:
+            self._mapping_source_table.setDragDropMode(QAbstractItemView.DragDropMode.NoDragDrop)
+            self._mapping_source_table.setDragEnabled(False)
+            self._mapping_source_table.setAcceptDrops(False)
+            self._mapping_source_table.setDropIndicatorShown(False)
+
+    def _on_source_rows_moved(self, *_args: object) -> None:
+        if self._source_order_mode != SOURCE_ORDER_MANUAL:
+            return
+        order = self._get_source_table_order()
+        self._source_manual_order = order
+        self._source_row_lookup = {name: idx for idx, name in enumerate(order)}
+
+    def _get_source_table_selected_names(self) -> list[str]:
+        model = self._mapping_source_table.selectionModel()
+        if model is None:
+            return []
+        names: list[str] = []
+        for index in model.selectedRows(0):
+            item = self._mapping_source_table.item(index.row(), 0)
+            if item is None:
+                continue
+            names.append(item.data(Qt.ItemDataRole.UserRole) or item.text())
+        return names
+
+    def _set_source_table_selection(self, names: list[str]) -> None:
+        model = self._mapping_source_table.selectionModel()
+        if model is None:
+            return
+        self._mapping_source_table.clearSelection()
+        if not names:
+            return
+        for name in names:
+            row = self._source_row_lookup.get(name)
+            if row is None:
+                continue
+            index = self._mapping_source_table.model().index(row, 0)
+            model.select(index, QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows)
+        first_row = self._source_row_lookup.get(names[0])
+        if first_row is not None:
+            self._mapping_source_table.setCurrentCell(first_row, 0)
+            item = self._mapping_source_table.item(first_row, 0)
+            if item is not None:
+                self._mapping_source_table.scrollToItem(
+                    item, QAbstractItemView.ScrollHint.PositionAtCenter
+                )
+
+    def _get_source_table_order(self) -> list[str]:
+        order: list[str] = []
+        for row in range(self._mapping_source_table.rowCount()):
+            item = self._mapping_source_table.item(row, 0)
+            if item is None:
+                continue
+            order.append(item.data(Qt.ItemDataRole.UserRole) or item.text())
+        return order
+
+    def _compute_source_usage_counts(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for mapping in self._zone.get("field_mappings", []):
+            if mapping.get("mode") == "simple":
+                src = mapping.get("source_col") or ""
+                if src:
+                    counts[src] = counts.get(src, 0) + 1
+            elif mapping.get("mode") == "concat":
+                concat = mapping.get("concat") or {}
+                for src in concat.get("sources", []):
+                    col = src.get("col") or ""
+                    if col:
+                        counts[col] = counts.get(col, 0) + 1
+        return counts
+
+    def _compute_source_preview_values(self, source_cols: list[str]) -> tuple[dict[str, str], bool]:
+        values: dict[str, str] = {}
+        row_value = self._source_preview_row_spin.value()
+        if row_value == 0:
+            for col in source_cols:
+                values[col] = col
+            return values, False
+        if self._source_df is None:
+            return values, False
+        row_index = row_value - 1
+        if row_index < 0 or row_index >= len(self._source_df):
+            return values, True
+        for idx, col in enumerate(source_cols):
+            if idx >= self._source_df.shape[1]:
+                continue
+            val = self._source_df.iat[row_index, idx]
+            values[col] = _format_value(val)
+        return values, False
+
+    def _apply_source_order(
+        self,
+        source_cols: list[str],
+        preview_values: dict[str, str],
+        usage_counts: dict[str, int],
+    ) -> list[str]:
+        mode = self._source_order_mode
+        if mode == SOURCE_ORDER_AZ:
+            return sorted(source_cols, key=lambda x: str(x).lower())
+        if mode == SOURCE_ORDER_ZA:
+            return sorted(source_cols, key=lambda x: str(x).lower(), reverse=True)
+        if mode == SOURCE_ORDER_VALUE:
+            return sorted(
+                source_cols,
+                key=lambda x: (
+                    preview_values.get(x, "") == "",
+                    preview_values.get(x, "").lower(),
+                ),
+            )
+        if mode == SOURCE_ORDER_USAGE:
+            return sorted(
+                source_cols,
+                key=lambda x: -usage_counts.get(x, 0),
+            )
+        if mode == SOURCE_ORDER_MANUAL:
+            ordered = [col for col in self._source_manual_order if col in source_cols]
+            for col in source_cols:
+                if col not in ordered:
+                    ordered.append(col)
+            return ordered
+        return list(source_cols)
+
+    def _refresh_source_table(self, *, keep_selection: bool) -> None:
+        source_cols = self._get_source_cols()
+        if not source_cols:
+            self._mapping_source_table.clearContents()
+            self._mapping_source_table.setRowCount(0)
+            self._source_row_lookup = {}
+            return
+        selected = self._get_source_table_selected_names() if keep_selection else []
+        usage_counts = self._compute_source_usage_counts()
+        preview_values, out_of_range = self._compute_source_preview_values(source_cols)
+        ordered_cols = self._apply_source_order(source_cols, preview_values, usage_counts)
+
+        self._mapping_source_table.setRowCount(len(ordered_cols))
+        self._source_row_lookup = {}
+        for row_idx, col in enumerate(ordered_cols):
+            self._source_row_lookup[col] = row_idx
+
+            item_col = QTableWidgetItem(col)
+            item_col.setData(Qt.ItemDataRole.UserRole, col)
+            item_col.setFlags(item_col.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self._mapping_source_table.setItem(row_idx, 0, item_col)
+
+            raw_value = preview_values.get(col, "")
+            if out_of_range:
+                display_value = "(hors limites)"
+                placeholder = True
+            elif raw_value == "":
+                display_value = "(vide)"
+                placeholder = True
+            else:
+                display_value = raw_value
+                placeholder = False
+            item_val = QTableWidgetItem(display_value)
+            item_val.setData(Qt.ItemDataRole.UserRole, raw_value)
+            item_val.setToolTip(raw_value)
+            item_val.setFlags(item_val.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            if placeholder:
+                item_val.setForeground(Qt.GlobalColor.gray)
+            self._mapping_source_table.setItem(row_idx, 1, item_val)
+
+            count = usage_counts.get(col, 0)
+            item_usage = QTableWidgetItem("" if count == 0 else str(count))
+            item_usage.setData(Qt.ItemDataRole.UserRole, count)
+            item_usage.setTextAlignment(
+                Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter
+            )
+            item_usage.setFlags(item_usage.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self._mapping_source_table.setItem(row_idx, 2, item_usage)
+
+        header_item = self._mapping_source_table.horizontalHeaderItem(1)
+        if header_item is not None:
+            header_item.setText(f"Apercu (ligne {self._source_preview_row_spin.value()})")
+
+        if keep_selection:
+            self._set_source_table_selection(selected)
+        else:
+            self._mapping_source_table.clearSelection()
 
     def _get_zone_target_columns(self) -> list[dict[str, Any]]:
         if self._template_df_raw is None:
@@ -515,6 +797,7 @@ class MappingScreen(QWidget):
             self._mapping_detail_hint.setVisible(True)
             self._mapping_concat_panel.setVisible(False)
             self._concat_empty_hint.setVisible(True)
+        self._sync_source_selection(mapping)
 
     def _clear_mapping_detail(self) -> None:
         self._mapping_target_label.setText("—")
@@ -524,6 +807,24 @@ class MappingScreen(QWidget):
         self._mapping_concat_panel.setVisible(False)
         self._concat_empty_hint.setVisible(True)
 
+    def _sync_source_selection(self, mapping: dict[str, Any] | None) -> None:
+        if not mapping:
+            return
+        mode = mapping.get("mode")
+        cols: list[str] = []
+        if mode == "simple":
+            src = mapping.get("source_col") or ""
+            if src:
+                cols = [src]
+        elif mode == "concat":
+            concat = mapping.get("concat") or {}
+            for src in concat.get("sources", []):
+                col = src.get("col") or ""
+                if col:
+                    cols.append(col)
+        if cols:
+            self._set_source_table_selection(cols)
+
     def _get_mapping(self, target: str) -> dict[str, Any] | None:
         for m in self._zone.get("field_mappings", []):
             if target and m.get("target") == target:
@@ -531,19 +832,16 @@ class MappingScreen(QWidget):
         return None
 
     def _get_primary_source_column(self) -> str:
-        current = self._mapping_source_list.currentItem()
-        if current is not None:
-            return current.data(Qt.ItemDataRole.UserRole) or current.text()
-        items = self._mapping_source_list.selectedItems()
-        if items:
-            return items[0].data(Qt.ItemDataRole.UserRole) or items[0].text()
-        return ""
+        row = self._mapping_source_table.currentRow()
+        if row >= 0:
+            item = self._mapping_source_table.item(row, 0)
+            if item is not None:
+                return item.data(Qt.ItemDataRole.UserRole) or item.text()
+        selected = self._get_source_table_selected_names()
+        return selected[0] if selected else ""
 
     def _selected_source_columns(self) -> list[str]:
-        out: list[str] = []
-        for item in self._mapping_source_list.selectedItems():
-            out.append(item.data(Qt.ItemDataRole.UserRole) or item.text())
-        return out
+        return self._get_source_table_selected_names()
 
     # --- Preview ---
     def _calc_header_rows(self, zone: dict[str, Any]) -> int:
@@ -555,10 +853,7 @@ class MappingScreen(QWidget):
         if tech_row:
             rows.append(int(tech_row))
         header_end = max(rows) if rows else row_start
-        data_start = zone.get("data_start_row")
-        if data_start in (None, ""):
-            data_start = header_end + 1
-        return max(0, int(data_start) - row_start)
+        return max(0, header_end - row_start + 1)
 
     def _refresh_mapping_preview(self) -> None:
         if self._template_df_raw is None or self._source_df is None:
@@ -853,29 +1148,15 @@ class MappingScreen(QWidget):
 
     # --- Source usage ---
     def _refresh_source_usage(self) -> None:
-        counts: dict[str, int] = {}
-        for mapping in self._zone.get("field_mappings", []):
-            if mapping.get("mode") == "simple":
-                src = mapping.get("source_col") or ""
-                if src:
-                    counts[src] = counts.get(src, 0) + 1
-            elif mapping.get("mode") == "concat":
-                concat = mapping.get("concat") or {}
-                for src in concat.get("sources", []):
-                    col = src.get("col") or ""
-                    if col:
-                        counts[col] = counts.get(col, 0) + 1
-        for i in range(self._mapping_source_list.count()):
-            item = self._mapping_source_list.item(i)
-            label = item.data(Qt.ItemDataRole.UserRole) or item.text()
-            count = counts.get(label, 0)
-            suffix = f" ({count})" if count > 1 else ""
-            item.setText(f"{label}{suffix}")
+        self._refresh_source_table(keep_selection=True)
 
     # --- Export ---
     def _export(self) -> None:
         if not self._template_path or not self._source_path:
             QMessageBox.warning(self, "Attention", "Chargez un template et une source.")
+            return
+        if self._export_thread is not None and self._export_thread.isRunning():
+            QMessageBox.information(self, "Export", "Un export est deja en cours.")
             return
         path, _ = QFileDialog.getSaveFileName(self, "Exporter", "", SUPPORTED_OUTPUT_FILTER)
         if not path:
@@ -890,11 +1171,31 @@ class MappingScreen(QWidget):
                 source_sheet=self._source_sheet_combo.currentText() or None,
                 source_header_row=self._source_header_spin.value(),
                 zones=[zone_spec],
-                output_mode="single",
                 output_sheet_name="Output",
             )
-            output = build_output(config)
-            save_output(path, output, header=False, index=False)
-            QMessageBox.information(self, "Export", "Export terminé.")
+            self._start_export(config, path)
         except Exception as e:
             QMessageBox.critical(self, "Erreur", str(e))
+
+    def _start_export(self, config: TemplateBuilderConfig, path: str) -> None:
+        self._export_btn.setEnabled(False)
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        self._export_thread = QThread(self)
+        self._export_worker = _ExportWorker(config, path)
+        self._export_worker.moveToThread(self._export_thread)
+        self._export_thread.started.connect(self._export_worker.run)
+        self._export_worker.finished.connect(self._on_export_finished)
+        self._export_worker.finished.connect(self._export_thread.quit)
+        self._export_worker.finished.connect(self._export_worker.deleteLater)
+        self._export_thread.finished.connect(self._export_thread.deleteLater)
+        self._export_thread.start()
+
+    def _on_export_finished(self, ok: bool, message: str) -> None:
+        QApplication.restoreOverrideCursor()
+        self._export_btn.setEnabled(True)
+        self._export_worker = None
+        self._export_thread = None
+        if ok:
+            QMessageBox.information(self, "Export", "Export termine.")
+        else:
+            QMessageBox.critical(self, "Erreur", message)

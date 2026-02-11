@@ -28,6 +28,7 @@ jobs:
           name: windows-artifacts
           path: |
             dist/MapalaPortable.zip
+            dist/Mapala/Mapala.exe
 
   macos:
     runs-on: macos-latest
@@ -74,5 +75,6 @@ jobs:
         with:
           files: |
             dist/windows-artifacts/MapalaPortable.zip
+            dist/windows-artifacts/Mapala.exe
             dist/macos-artifacts/Mapala.dmg
             dist/macos-artifacts/Mapala.app.zip

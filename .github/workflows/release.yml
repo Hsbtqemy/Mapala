@@ -31,6 +31,7 @@ jobs:
           path: |
             dist/MapalaPortable.zip
             dist/Mapala.exe
+          if-no-files-found: error
 
   macos:
     runs-on: macos-latest
@@ -76,7 +77,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/windows-artifacts/MapalaPortable.zip
-            dist/windows-artifacts/Mapala.exe
+            dist/windows-artifacts/**/MapalaPortable.zip
+            dist/windows-artifacts/**/Mapala.exe
             dist/macos-artifacts/Mapala.dmg
             dist/macos-artifacts/Mapala.app.zip

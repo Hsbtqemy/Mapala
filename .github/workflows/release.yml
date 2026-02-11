@@ -20,8 +20,8 @@ jobs:
           python -m pip install -e ".[build,formats]"
       - name: Build executable
         run: python build_exe.py
-      - name: Copy exe for release
-        run: powershell Copy-Item -Path dist\Mapala\Mapala.exe -Destination dist\Mapala.exe -Force
+      - name: Copy standalone exe for release
+        run: powershell Copy-Item -Path dist\MapalaStandalone.exe -Destination dist\Mapala.exe -Force
       - name: Package portable zip
         run: powershell Compress-Archive -Path dist\Mapala\* -DestinationPath dist\MapalaPortable.zip
       - name: Upload artifacts
@@ -31,6 +31,7 @@ jobs:
           path: |
             dist/MapalaPortable.zip
             dist/Mapala.exe
+            dist/MapalaStandalone.exe
           if-no-files-found: error
 
   macos:
@@ -79,5 +80,6 @@ jobs:
           files: |
             dist/windows-artifacts/**/MapalaPortable.zip
             dist/windows-artifacts/**/Mapala.exe
+            dist/windows-artifacts/**/MapalaStandalone.exe
             dist/macos-artifacts/Mapala.dmg
             dist/macos-artifacts/Mapala.app.zip

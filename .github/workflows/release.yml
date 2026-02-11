@@ -20,6 +20,8 @@ jobs:
           python -m pip install -e ".[build,formats]"
       - name: Build executable
         run: python build_exe.py
+      - name: Copy exe for release
+        run: powershell Copy-Item -Path dist\Mapala\Mapala.exe -Destination dist\Mapala.exe -Force
       - name: Package portable zip
         run: powershell Compress-Archive -Path dist\Mapala\* -DestinationPath dist\MapalaPortable.zip
       - name: Upload artifacts
@@ -28,7 +30,7 @@ jobs:
           name: windows-artifacts
           path: |
             dist/MapalaPortable.zip
-            dist/Mapala/Mapala.exe
+            dist/Mapala.exe
 
   macos:
     runs-on: macos-latest

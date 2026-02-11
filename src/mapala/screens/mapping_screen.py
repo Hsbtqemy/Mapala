@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
-from PySide6.QtCore import QEvent, QObject, QItemSelectionModel, QThread, Qt, Signal
+from PySide6.QtCore import QEvent, QObject, QItemSelectionModel, QThread, QTimer, Qt, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -103,6 +104,18 @@ def _parse_int_list(text: str) -> list[int]:
     return items
 
 
+def _default_zone() -> dict[str, Any]:
+    return {
+        "name": "Zone",
+        "row_start": 1,
+        "row_end": None,
+        "col_start": 1,
+        "col_end": None,
+        "header": {"tech_row": 1, "label_rows": []},
+        "field_mappings": [],
+    }
+
+
 class _ConcatSourceWidget(QWidget):
     changed = Signal()
 
@@ -143,15 +156,7 @@ class MappingScreen(QWidget):
         self._source_path: str = ""
         self._template_df_raw: pd.DataFrame | None = None
         self._source_df: pd.DataFrame | None = None
-        self._zone: dict[str, Any] = {
-            "name": "Zone",
-            "row_start": 1,
-            "row_end": None,
-            "col_start": 1,
-            "col_end": None,
-            "header": {"tech_row": 1, "label_rows": []},
-            "field_mappings": [],
-        }
+        self._zone: dict[str, Any] = _default_zone()
         self._current_mapping_cols: list[int] = []
         self._current_mapping_labels: list[str] = []
         self._current_preview_col: int | None = None
@@ -164,6 +169,11 @@ class MappingScreen(QWidget):
         self._source_row_lookup: dict[str, int] = {}
         self._export_thread: QThread | None = None
         self._export_worker: _ExportWorker | None = None
+        self._session_loading = False
+        self._autosave_path = Path.home() / ".mapala_autosave.json"
+        self._autosave_timer = QTimer(self)
+        self._autosave_timer.setSingleShot(True)
+        self._autosave_timer.timeout.connect(self._write_autosave)
         self._setup_ui()
 
     def _setup_ui(self) -> None:
@@ -184,18 +194,21 @@ class MappingScreen(QWidget):
         source_group = QGroupBox("Colonnes source")
         source_layout = QVBoxLayout()
         source_header = QHBoxLayout()
-        self._source_file_label = QLabel("Source: — (cliquez la liste pour charger)")
+        self._source_file_label = QLabel("Source: - (cliquez la table pour charger)")
         self._source_sheet_combo = QComboBox()
         self._source_sheet_combo.currentTextChanged.connect(self._on_source_sheet_changed)
         self._source_header_spin = QSpinBox()
         self._source_header_spin.setRange(1, 1000000)
         self._source_header_spin.setValue(1)
         self._source_header_spin.valueChanged.connect(lambda _v: self._reload_source())
+        self._source_change_btn = QPushButton("Changer...")
+        self._source_change_btn.clicked.connect(self._browse_source)
         source_header.addWidget(self._source_file_label, 1)
         source_header.addWidget(QLabel("Feuille:"))
         source_header.addWidget(self._source_sheet_combo)
         source_header.addWidget(QLabel("En-tête:"))
         source_header.addWidget(self._source_header_spin)
+        source_header.addWidget(self._source_change_btn)
         source_layout.addLayout(source_header)
 
         source_tools = QHBoxLayout()
@@ -326,7 +339,7 @@ class MappingScreen(QWidget):
         preview_layout = QVBoxLayout()
 
         template_controls = QHBoxLayout()
-        self._template_file_label = QLabel("Template: — (cliquez la preview pour charger)")
+        self._template_file_label = QLabel("Template: - (cliquez la preview pour charger)")
         self._template_sheet_combo = QComboBox()
         self._template_sheet_combo.currentTextChanged.connect(self._on_template_sheet_changed)
         self._template_tech_row_spin = QSpinBox()
@@ -336,6 +349,8 @@ class MappingScreen(QWidget):
         self._template_label_rows_edit = QLineEdit()
         self._template_label_rows_edit.setPlaceholderText("Lignes labels (ex: 1,2)")
         self._template_label_rows_edit.editingFinished.connect(self._refresh_mapping_preview)
+        self._template_change_btn = QPushButton("Changer...")
+        self._template_change_btn.clicked.connect(self._browse_template)
         template_controls.addWidget(self._template_file_label, 1)
         template_controls.addWidget(QLabel("Feuille:"))
         template_controls.addWidget(self._template_sheet_combo)
@@ -343,6 +358,7 @@ class MappingScreen(QWidget):
         template_controls.addWidget(self._template_tech_row_spin)
         template_controls.addWidget(QLabel("Labels:"))
         template_controls.addWidget(self._template_label_rows_edit)
+        template_controls.addWidget(self._template_change_btn)
         preview_layout.addLayout(template_controls)
 
         preview_controls = QHBoxLayout()
@@ -370,6 +386,46 @@ class MappingScreen(QWidget):
         header.setStretchLastSection(False)
         self._mapping_preview_table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self._mapping_preview_table.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self._mapping_preview_table.setStyleSheet(
+            "QScrollBar:vertical {"
+            "  background: #efefef;"
+            "  width: 14px;"
+            "  margin: 0px;"
+            "}"
+            "QScrollBar::handle:vertical {"
+            "  background: #9b9b9b;"
+            "  min-height: 24px;"
+            "  border-radius: 6px;"
+            "}"
+            "QScrollBar::handle:vertical:hover {"
+            "  background: #7f7f7f;"
+            "}"
+            "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {"
+            "  height: 0px;"
+            "}"
+            "QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {"
+            "  background: none;"
+            "}"
+            "QScrollBar:horizontal {"
+            "  background: #efefef;"
+            "  height: 14px;"
+            "  margin: 0px;"
+            "}"
+            "QScrollBar::handle:horizontal {"
+            "  background: #9b9b9b;"
+            "  min-width: 24px;"
+            "  border-radius: 6px;"
+            "}"
+            "QScrollBar::handle:horizontal:hover {"
+            "  background: #7f7f7f;"
+            "}"
+            "QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {"
+            "  width: 0px;"
+            "}"
+            "QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {"
+            "  background: none;"
+            "}"
+        )
         self._mapping_preview_table.cellClicked.connect(self._on_preview_cell_clicked)
         self._mapping_preview_table.viewport().installEventFilter(self)
         preview_layout.addWidget(self._mapping_preview_table, 1)
@@ -377,13 +433,25 @@ class MappingScreen(QWidget):
         preview_group.setLayout(preview_layout)
         main_split.addWidget(preview_group)
 
-        main_split.setStretchFactor(0, 3)
-        main_split.setStretchFactor(1, 2)
+        main_split.setStretchFactor(0, 2)
+        main_split.setStretchFactor(1, 3)
         main_split.setChildrenCollapsible(False)
-        main_split.setSizes([600, 400])
+        main_split.setSizes([450, 550])
 
         # Footer
         footer = QHBoxLayout()
+        self._save_session_btn = QPushButton("Sauver")
+        self._save_session_btn.clicked.connect(self._save_session_dialog)
+        self._load_session_btn = QPushButton("Charger")
+        self._load_session_btn.clicked.connect(self._load_session_dialog)
+        self._reset_session_btn = QPushButton("Reset")
+        self._reset_session_btn.clicked.connect(self._reset_session)
+        self._reset_mapping_btn = QPushButton("Reset mappings")
+        self._reset_mapping_btn.clicked.connect(self._reset_mappings)
+        footer.addWidget(self._save_session_btn)
+        footer.addWidget(self._load_session_btn)
+        footer.addWidget(self._reset_session_btn)
+        footer.addWidget(self._reset_mapping_btn)
         footer.addStretch()
         self._export_btn = QPushButton("Exporter")
         self._export_btn.clicked.connect(self._export)
@@ -474,6 +542,7 @@ class MappingScreen(QWidget):
             return
         self._update_zone_bounds()
         self._refresh_mapping_preview()
+        self._schedule_autosave()
 
     def _reload_source(self) -> None:
         if not self._source_path:
@@ -486,6 +555,7 @@ class MappingScreen(QWidget):
             return
         self._refresh_mapping_sources()
         self._refresh_mapping_preview()
+        self._schedule_autosave()
 
     # --- Zone/mapping helpers ---
     def _update_zone_bounds(self) -> None:
@@ -509,11 +579,24 @@ class MappingScreen(QWidget):
     def _refresh_mapping_sources(self) -> None:
         source_cols = self._get_source_cols()
         self._source_default_order = list(source_cols)
-        self._source_manual_order = list(source_cols)
         self._source_row_lookup = {}
-        self._source_order_mode = SOURCE_ORDER_ORIGIN
+        if not self._session_loading:
+            self._source_manual_order = list(source_cols)
+            self._source_order_mode = SOURCE_ORDER_ORIGIN
+        else:
+            if not self._source_manual_order:
+                self._source_manual_order = list(source_cols)
+            if self._source_order_mode not in (
+                SOURCE_ORDER_ORIGIN,
+                SOURCE_ORDER_AZ,
+                SOURCE_ORDER_ZA,
+                SOURCE_ORDER_VALUE,
+                SOURCE_ORDER_USAGE,
+                SOURCE_ORDER_MANUAL,
+            ):
+                self._source_order_mode = SOURCE_ORDER_ORIGIN
         self._source_order_combo.blockSignals(True)
-        idx = self._source_order_combo.findData(SOURCE_ORDER_ORIGIN)
+        idx = self._source_order_combo.findData(self._source_order_mode)
         if idx >= 0:
             self._source_order_combo.setCurrentIndex(idx)
         self._source_order_combo.blockSignals(False)
@@ -567,6 +650,7 @@ class MappingScreen(QWidget):
         order = self._get_source_table_order()
         self._source_manual_order = order
         self._source_row_lookup = {name: idx for idx, name in enumerate(order)}
+        self._schedule_autosave()
 
     def _get_source_table_selected_names(self) -> list[str]:
         model = self._mapping_source_table.selectionModel()
@@ -734,6 +818,7 @@ class MappingScreen(QWidget):
             self._set_source_table_selection(selected)
         else:
             self._mapping_source_table.clearSelection()
+        self._schedule_autosave()
 
     def _get_zone_target_columns(self) -> list[dict[str, Any]]:
         if self._template_df_raw is None:
@@ -943,6 +1028,7 @@ class MappingScreen(QWidget):
         self._refresh_source_usage()
 
         self._mapping_preview_label.setText(f"{len(data_df)} lignes × {col_count} colonnes")
+        self._schedule_autosave()
 
     def _build_mapping_cell_widget(
         self,
@@ -1174,6 +1260,234 @@ class MappingScreen(QWidget):
     # --- Source usage ---
     def _refresh_source_usage(self) -> None:
         self._refresh_source_table(keep_selection=True)
+
+    def _schedule_autosave(self) -> None:
+        if self._session_loading:
+            return
+        self._autosave_timer.start(800)
+
+    def _collect_session_state(self) -> dict[str, Any]:
+        return {
+            "version": 1,
+            "template": {
+                "path": self._template_path,
+                "sheet": self._template_sheet_combo.currentText() or None,
+                "tech_row": self._template_tech_row_spin.value(),
+                "label_rows": _parse_int_list(self._template_label_rows_edit.text()),
+            },
+            "source": {
+                "path": self._source_path,
+                "sheet": self._source_sheet_combo.currentText() or None,
+                "header_row": self._source_header_spin.value(),
+            },
+            "zone": {
+                "field_mappings": list(self._zone.get("field_mappings", [])),
+            },
+            "preview_rows": self._mapping_preview_rows_spin.value(),
+            "source_preview_row": self._source_preview_row_spin.value(),
+            "source_order_mode": self._source_order_mode,
+            "source_manual_order": list(self._source_manual_order),
+        }
+
+    def _write_session_file(self, path: Path, state: dict[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as handle:
+            json.dump(state, handle, ensure_ascii=True, indent=2)
+
+    def _read_session_file(self, path: Path) -> dict[str, Any] | None:
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                return json.load(handle)
+        except Exception:
+            return None
+
+    def _write_autosave(self) -> None:
+        try:
+            state = self._collect_session_state()
+            self._write_session_file(self._autosave_path, state)
+        except Exception:
+            pass
+
+    def has_autosave(self) -> bool:
+        return self._autosave_path.exists()
+
+    def save_autosave(self) -> None:
+        self._write_autosave()
+
+    def restore_autosave(self) -> None:
+        if not self._autosave_path.exists():
+            return
+        state = self._read_session_file(self._autosave_path)
+        if not state:
+            return
+        self._apply_session_state(state, show_errors=False)
+
+    def _save_session_dialog(self) -> None:
+        path_str, _ = QFileDialog.getSaveFileName(
+            self,
+            "Sauver session",
+            "",
+            "Mapala (*.mapala.json);;JSON (*.json)",
+        )
+        if not path_str:
+            return
+        if not path_str.endswith(".json"):
+            path_str = f"{path_str}.mapala.json"
+        try:
+            state = self._collect_session_state()
+            self._write_session_file(Path(path_str), state)
+        except Exception as e:
+            QMessageBox.critical(self, "Erreur", str(e))
+
+    def _load_session_dialog(self) -> None:
+        path_str, _ = QFileDialog.getOpenFileName(
+            self,
+            "Charger session",
+            "",
+            "Mapala (*.mapala.json);;JSON (*.json);;Tous (*.*)",
+        )
+        if not path_str:
+            return
+        state = self._read_session_file(Path(path_str))
+        if not state:
+            QMessageBox.critical(self, "Erreur", "Session invalide ou illisible.")
+            return
+        self._apply_session_state(state, show_errors=True)
+
+    def _delete_autosave(self) -> None:
+        try:
+            self._autosave_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    def _reset_state(self) -> None:
+        self._template_path = ""
+        self._source_path = ""
+        self._template_df_raw = None
+        self._source_df = None
+        self._zone = _default_zone()
+        self._current_mapping_cols = []
+        self._current_mapping_labels = []
+        self._current_preview_col = None
+        self._preview_combo_by_col = {}
+        self._preview_concat_btn_by_col = {}
+        self._source_order_mode = SOURCE_ORDER_ORIGIN
+        self._source_default_order = []
+        self._source_manual_order = []
+        self._source_row_lookup = {}
+
+        self._template_file_label.setText("Template: - (cliquez la preview pour charger)")
+        self._source_file_label.setText("Source: - (cliquez la table pour charger)")
+
+        self._template_sheet_combo.blockSignals(True)
+        self._template_sheet_combo.clear()
+        self._template_sheet_combo.blockSignals(False)
+        self._source_sheet_combo.blockSignals(True)
+        self._source_sheet_combo.clear()
+        self._source_sheet_combo.blockSignals(False)
+
+        self._template_tech_row_spin.setValue(1)
+        self._template_label_rows_edit.setText("")
+        self._source_header_spin.setValue(1)
+        self._mapping_preview_rows_spin.setValue(5)
+        self._source_preview_row_spin.setValue(1)
+
+        self._mapping_preview_table.clear()
+        self._mapping_preview_table.setRowCount(0)
+        self._mapping_preview_table.setColumnCount(0)
+        self._mapping_preview_label.setText("Chargez un template et une source.")
+
+        self._mapping_source_table.clearContents()
+        self._mapping_source_table.setRowCount(0)
+
+        self._concat_sources_list.clear()
+        self._clear_mapping_detail()
+
+        self._source_order_combo.blockSignals(True)
+        idx = self._source_order_combo.findData(SOURCE_ORDER_ORIGIN)
+        if idx >= 0:
+            self._source_order_combo.setCurrentIndex(idx)
+        self._source_order_combo.blockSignals(False)
+
+    def _reset_session(self) -> None:
+        reply = QMessageBox.question(
+            self,
+            "Reset",
+            "Reinitialiser la session en cours ?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        self._reset_state()
+        self._delete_autosave()
+
+    def _reset_mappings(self) -> None:
+        if not self._zone.get("field_mappings"):
+            return
+        reply = QMessageBox.question(
+            self,
+            "Reset mappings",
+            "Effacer tous les mappings ?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        self._zone["field_mappings"] = []
+        self._clear_mapping_detail()
+        self._refresh_mapping_preview()
+        self._refresh_source_usage()
+        self._schedule_autosave()
+
+    def _apply_session_state(self, state: dict[str, Any], *, show_errors: bool) -> None:
+        self._session_loading = True
+        try:
+            self._reset_state()
+            template = state.get("template", {})
+            source = state.get("source", {})
+
+            self._template_tech_row_spin.setValue(int(template.get("tech_row", 1)))
+            label_rows = template.get("label_rows", [])
+            self._template_label_rows_edit.setText(",".join(str(x) for x in label_rows))
+            self._source_header_spin.setValue(int(source.get("header_row", 1)))
+            self._mapping_preview_rows_spin.setValue(int(state.get("preview_rows", 5)))
+            self._source_preview_row_spin.setValue(int(state.get("source_preview_row", 1)))
+            self._source_order_mode = state.get("source_order_mode", SOURCE_ORDER_ORIGIN)
+            self._source_manual_order = list(state.get("source_manual_order", []))
+
+            zone = state.get("zone", {})
+            self._zone = _default_zone()
+            self._zone["field_mappings"] = list(zone.get("field_mappings", []))
+
+            template_path = str(template.get("path") or "")
+            if template_path:
+                if Path(template_path).exists():
+                    self._template_path = template_path
+                    self._template_file_label.setText(f"Template: {Path(template_path).name}")
+                    self._load_template_sheets()
+                    if template.get("sheet"):
+                        self._template_sheet_combo.setCurrentText(str(template.get("sheet")))
+                elif show_errors:
+                    QMessageBox.warning(self, "Session", f"Template introuvable: {template_path}")
+
+            source_path = str(source.get("path") or "")
+            if source_path:
+                if Path(source_path).exists():
+                    self._source_path = source_path
+                    self._source_file_label.setText(f"Source: {Path(source_path).name}")
+                    self._load_source_sheets()
+                    if source.get("sheet"):
+                        self._source_sheet_combo.setCurrentText(str(source.get("sheet")))
+                elif show_errors:
+                    QMessageBox.warning(self, "Session", f"Source introuvable: {source_path}")
+
+            idx = self._source_order_combo.findData(self._source_order_mode)
+            if idx >= 0:
+                self._source_order_combo.setCurrentIndex(idx)
+
+            self._refresh_source_table(keep_selection=False)
+            self._refresh_mapping_preview()
+        finally:
+            self._session_loading = False
 
     # --- Export ---
     def _build_export_config(self) -> TemplateBuilderConfig:

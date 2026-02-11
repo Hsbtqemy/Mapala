@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QMenu,
     QMessageBox,
     QPushButton,
     QSizePolicy,
@@ -58,15 +59,31 @@ SOURCE_ORDER_MANUAL = "manual"
 class _ExportWorker(QObject):
     finished = Signal(bool, str)
 
-    def __init__(self, config: TemplateBuilderConfig, output_path: str) -> None:
+    def __init__(
+        self,
+        config: TemplateBuilderConfig,
+        output_path: str,
+        *,
+        csv_separator: str = ";",
+        drop_empty_columns: bool = False,
+    ) -> None:
         super().__init__()
         self._config = config
         self._output_path = output_path
+        self._csv_separator = csv_separator
+        self._drop_empty_columns = drop_empty_columns
 
     def run(self) -> None:
         try:
             output = build_output(self._config)
-            save_output(self._output_path, output, header=False, index=False)
+            save_output(
+                self._output_path,
+                output,
+                header=False,
+                index=False,
+                csv_separator=self._csv_separator,
+                drop_empty_columns=self._drop_empty_columns,
+            )
         except Exception as e:
             self.finished.emit(False, str(e))
             return
@@ -370,6 +387,12 @@ class MappingScreen(QWidget):
         footer.addStretch()
         self._export_btn = QPushButton("Exporter")
         self._export_btn.clicked.connect(self._export)
+        self._export_menu = QMenu(self._export_btn)
+        export_csv_full = self._export_menu.addAction("Exporter CSV (complet)")
+        export_csv_full.triggered.connect(lambda _checked=False: self._export_csv(False))
+        export_csv_trim = self._export_menu.addAction("Exporter CSV (sans colonnes vides)")
+        export_csv_trim.triggered.connect(lambda _checked=False: self._export_csv(True))
+        self._export_btn.setMenu(self._export_menu)
         footer.addWidget(self._export_btn)
         layout.addLayout(footer)
 
@@ -1151,6 +1174,19 @@ class MappingScreen(QWidget):
         self._refresh_source_table(keep_selection=True)
 
     # --- Export ---
+    def _build_export_config(self) -> TemplateBuilderConfig:
+        self._update_zone_header()
+        zone_spec = ZoneSpec.from_dict(self._zone)
+        return TemplateBuilderConfig(
+            template_file=self._template_path,
+            template_sheet=self._template_sheet_combo.currentText() or None,
+            source_file=self._source_path,
+            source_sheet=self._source_sheet_combo.currentText() or None,
+            source_header_row=self._source_header_spin.value(),
+            zones=[zone_spec],
+            output_sheet_name="Output",
+        )
+
     def _export(self) -> None:
         if not self._template_path or not self._source_path:
             QMessageBox.warning(self, "Attention", "Chargez un template et une source.")
@@ -1162,26 +1198,46 @@ class MappingScreen(QWidget):
         if not path:
             return
         try:
-            self._update_zone_header()
-            zone_spec = ZoneSpec.from_dict(self._zone)
-            config = TemplateBuilderConfig(
-                template_file=self._template_path,
-                template_sheet=self._template_sheet_combo.currentText() or None,
-                source_file=self._source_path,
-                source_sheet=self._source_sheet_combo.currentText() or None,
-                source_header_row=self._source_header_spin.value(),
-                zones=[zone_spec],
-                output_sheet_name="Output",
-            )
-            self._start_export(config, path)
+            config = self._build_export_config()
+            self._start_export(config, path, csv_separator=";", drop_empty_columns=False)
         except Exception as e:
             QMessageBox.critical(self, "Erreur", str(e))
 
-    def _start_export(self, config: TemplateBuilderConfig, path: str) -> None:
+    def _export_csv(self, drop_empty_columns: bool) -> None:
+        if not self._template_path or not self._source_path:
+            QMessageBox.warning(self, "Attention", "Chargez un template et une source.")
+            return
+        if self._export_thread is not None and self._export_thread.isRunning():
+            QMessageBox.information(self, "Export", "Un export est deja en cours.")
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "Exporter CSV", "", "CSV (*.csv)")
+        if not path:
+            return
+        if Path(path).suffix.lower() != ".csv":
+            path = f"{path}.csv"
+        try:
+            config = self._build_export_config()
+            self._start_export(config, path, csv_separator=";", drop_empty_columns=drop_empty_columns)
+        except Exception as e:
+            QMessageBox.critical(self, "Erreur", str(e))
+
+    def _start_export(
+        self,
+        config: TemplateBuilderConfig,
+        path: str,
+        *,
+        csv_separator: str = ";",
+        drop_empty_columns: bool = False,
+    ) -> None:
         self._export_btn.setEnabled(False)
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         self._export_thread = QThread(self)
-        self._export_worker = _ExportWorker(config, path)
+        self._export_worker = _ExportWorker(
+            config,
+            path,
+            csv_separator=csv_separator,
+            drop_empty_columns=drop_empty_columns,
+        )
         self._export_worker.moveToThread(self._export_thread)
         self._export_thread.started.connect(self._export_worker.run)
         self._export_worker.finished.connect(self._on_export_finished)

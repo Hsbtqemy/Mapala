@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mapala"
-version = "0.1.7"
+version = "0.1.8"
 description = "Outil simple de mapping template/source avec concaténation"
 readme = "README.md"
 license = {text = "MIT"}

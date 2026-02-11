@@ -195,13 +195,18 @@ def save_output(
     *,
     header: bool = True,
     index: bool = False,
+    csv_separator: str = ";",
+    drop_empty_columns: bool = False,
 ) -> None:
     path = Path(filepath)
     suffix = path.suffix.lower()
     if suffix == ".csv":
         if not dataframes:
-            raise ExcelFileError("Aucune donnée à exporter.")
+            raise ExcelFileError("Aucune donnee a exporter.")
         df = next(iter(dataframes.values()))
-        df.to_csv(path, index=index, header=header)
+        if drop_empty_columns:
+            df = df.replace("", pd.NA).dropna(axis=1, how="all")
+        df.to_csv(path, index=index, header=header, sep=csv_separator)
         return
     save_spreadsheet(path, dataframes, header=header, index=index)
+
